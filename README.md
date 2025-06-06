@@ -39,7 +39,7 @@ git checkout main
 
 You should see "Building..." on the next page. After a few minutes, you should be able to try out your application.
 
-In a browser, go to the link given at the top of the app page along with any query modifiers (e.g. `https://my-app-dsyyq.ondigitalocean.app/add?a=3.5&b=2.1`) or files (e.g. ` curl -X POST -F "file=@test.txt" https://my-app-dsyyq.ondigitalocean.app/upload`). You should see the response from your app.
+In a browser, go to the link given at the top of the app page along with any query modifiers (e.g. `https://my-app-dsyyq.ondigitalocean.app/add?a=3.5&b=2.1`) or files (e.g. `curl -X POST -F "file=@test.txt" https://my-app-dsyyq.ondigitalocean.app/upload`). You should see the response from your app.
 
 ## Deploy Updates
 

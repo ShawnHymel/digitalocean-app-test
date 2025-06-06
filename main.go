@@ -3,17 +3,22 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
-	"strconv"
 )
 
-// AddResponse represents what we send back
-type AddResponse struct {
-	A      float64 `json:"a"`
-	B      float64 `json:"b"`
-	Result float64 `json:"result"`
+// FileResponse represents what we send back for file uploads
+type FileResponse struct {
+	Filename string `json:"filename"`
+	Contents string `json:"contents"`
+	Size     int64  `json:"size"`
+}
+
+// ErrorResponse for error handling
+type ErrorResponse struct {
+	Error string `json:"error"`
 }
 
 func main() {
@@ -23,52 +28,67 @@ func main() {
 		port = "8080"
 	}
 
-	// Set up our single endpoint
-	http.HandleFunc("/add", addHandler)
+	// API endpoint
+	http.HandleFunc("/upload", uploadHandler)
+	
+	// Simple status endpoint
+	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
 
-	fmt.Printf("Server running on port %s\n", port)
-	fmt.Println("Try: curl 'http://localhost:8080/add?a=3.5&b=2.1'")
+	fmt.Printf("File Upload API running on port %s\n", port)
+	fmt.Println("Endpoints:")
+	fmt.Println("  POST /upload - Upload file and get contents")
+	fmt.Println("  GET  /health - Health check")
 	
 	// Start the server
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
 
-// addHandler does the actual addition
-func addHandler(w http.ResponseWriter, r *http.Request) {
-	// Get the numbers from URL parameters
-	aStr := r.URL.Query().Get("a")
-	bStr := r.URL.Query().Get("b")
+// uploadHandler handles file uploads and returns contents
+func uploadHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
 
-	// Check if both parameters exist
-	if aStr == "" || bStr == "" {
-		http.Error(w, "Need both 'a' and 'b' parameters", http.StatusBadRequest)
+	// Only accept POST requests
+	if r.Method != "POST" {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "Only POST method allowed"})
 		return
 	}
 
-	// Convert strings to numbers
-	a, err := strconv.ParseFloat(aStr, 64)
+	// Parse the multipart form (10MB max)
+	err := r.ParseMultipartForm(10 << 20) // 10 MB limit
 	if err != nil {
-		http.Error(w, "Parameter 'a' must be a number", http.StatusBadRequest)
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "Unable to parse form"})
 		return
 	}
 
-	b, err := strconv.ParseFloat(bStr, 64)
+	// Get the file from form data
+	file, header, err := r.FormFile("file")
 	if err != nil {
-		http.Error(w, "Parameter 'b' must be a number", http.StatusBadRequest)
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "Unable to get file from form"})
+		return
+	}
+	defer file.Close()
+
+	// Read file contents
+	fileContents, err := io.ReadAll(file)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "Unable to read file"})
 		return
 	}
 
-	// Do the math!
-	result := a + b
-
-	// Create response
-	response := AddResponse{
-		A:      a,
-		B:      b,
-		Result: result,
+	// Create response with file info and contents
+	response := FileResponse{
+		Filename: header.Filename,
+		Contents: string(fileContents),
+		Size:     header.Size,
 	}
 
 	// Send JSON response
-	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
 }

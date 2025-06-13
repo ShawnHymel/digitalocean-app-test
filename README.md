@@ -8,10 +8,24 @@ To test the application locally:
 
 ```sh
 docker build -t digitalocean-app-test .
-docker run -p 8080:8080 digitalocean-app-test
+docker run -p 8080:8080 -e GRADING_TIMEOUT_MIN=10 -e MAX_FILE_SIZE_MB=100 digitalocean-app-test
 ```
 
-Use `curl` or a browser to navigate to your application with any query modifiers (e.g. `http://localhost:8080/add?a=3.5&b=2.1'`) or files (e.g. ` curl -X POST -F "file=@test.txt" localhost:8080/upload`). You should see the response from your app.
+Use `curl` to send `test/submission.zip`:
+
+```sh
+curl -X POST -F "file=@test/submission.zip" http://localhost:8080/submit
+```
+
+Copy the `job_id` from the respones.
+
+Do a GET request to get grading status (or browse to *http://localhost:8080/status/<JOB_ID>*):
+
+```sh
+ curl http://localhost:8080/status/<JOB_ID>
+```
+
+You should get a JSON response with `"status": "completed"` and a `"result"` field filled out by the dummy grader (*grade.py*).
 
 ## Initialize App on DigitalOcean (First Deploy)
 

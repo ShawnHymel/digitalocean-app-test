@@ -37,7 +37,7 @@ type Config struct {
 	QueueBufferSize     int
 	UploadsDir          string
 	GradingScriptPath   string
-	AllowedOrigins      []string      // CORS whitelist
+	AllowedOrigins      []string      // Origin whitelist (used for both CORS and request validation)
 	RequireAPIKey       bool          // Enable API key authentication
 	ValidAPIKeys        []string      // Valid API keys
 	AllowDirectAPICalls bool          // Allow requests without Origin/Referer headers
@@ -166,30 +166,42 @@ func authenticateRequest(r *http.Request) bool {
 	return false
 }
 
-// validateRequestOrigin checks if the request origin is allowed
+// Check if the request origin is allowed (whitelist validation)
 func validateRequestOrigin(r *http.Request) bool {
 	origin := r.Header.Get("Origin")
 	referer := r.Header.Get("Referer")
 	
-	// If no origin/referer, it's likely a direct API call
-	if origin == "" && referer == "" {
-		return config.AllowDirectAPICalls
-	}
-	
-	// Check origin against whitelist
-	if origin != "" && isOriginAllowed(origin) {
+	// Special case: "*" allows everything (development only)
+	if len(config.AllowedOrigins) == 1 && config.AllowedOrigins[0] == "*" {
 		return true
 	}
 	
-	// Check referer against whitelist
-	if referer != "" && isRefererAllowed(referer) {
-		return true
+	// Special case: Empty allowed origins = block everything except localhost
+	if len(config.AllowedOrigins) == 0 {
+		return false
 	}
 	
+	// Check 1: Browser request with Origin header
+	if origin != "" {
+		return isOriginAllowed(origin)
+	}
+	
+	// Check 2: Request with Referer header (some API clients send this)
+	if referer != "" {
+		return isRefererAllowed(referer)
+	}
+	
+	// Check 3: Direct API calls (no Origin/Referer)
+	// Rely on API key authentication for security
+	if config.AllowDirectAPICalls {
+		return true 
+	}
+	
+	// No valid origin/referer and direct calls disabled = block
 	return false
 }
 
-// isOriginAllowed checks if an origin is in the allowed list
+// Check if an origin is in the allowed list
 func isOriginAllowed(origin string) bool {
 	if len(config.AllowedOrigins) == 0 {
 		return false
@@ -256,7 +268,9 @@ func securityMiddleware(next http.HandlerFunc) http.HandlerFunc {
 		
 		// 3. Validate request origin (additional layer)
 		if !validateRequestOrigin(r) {
-			fmt.Printf("❌ Origin validation failed for %s %s\n", r.Method, r.URL.Path)
+			
+			// Log the blocked request and respond with 403 Forbidden
+			fmt.Printf("❌ Request blocked due to invalid origin: %s\n", r.Header.Get("Origin"))
 			w.WriteHeader(http.StatusForbidden)
 			json.NewEncoder(w).Encode(ErrorResponse{Error: "Request origin not allowed"})
 			return
@@ -290,7 +304,7 @@ func loadConfig() *Config {
 		AllowedOrigins:      parseAllowedOrigins(getEnv("ALLOWED_ORIGINS", "*")),
 		RequireAPIKey:       getEnvBool("REQUIRE_API_KEY", false),
 		ValidAPIKeys:        parseAPIKeys(getEnv("VALID_API_KEYS", "")),
-		AllowDirectAPICalls: getEnvBool("ALLOW_DIRECT_API_CALLS", true),
+		AllowDirectAPICalls: getEnvBool("ALLOW_DIRECT_API_CALLS", false),
 	}
 	
 	// Convert MB to bytes for file size
@@ -886,6 +900,7 @@ func main() {
 	fmt.Printf("   Grading script: %s\n", config.GradingScriptPath)
 	
 	// Print security configuration
+	fmt.Printf("   🔐 SECURITY CONFIGURATION:\n")
 	fmt.Printf("   API Key Required: %v\n", config.RequireAPIKey)
 	if config.RequireAPIKey {
 		fmt.Printf("   Valid API Keys: %d configured\n", len(config.ValidAPIKeys))
@@ -900,6 +915,17 @@ func main() {
 	}
 	fmt.Printf("   Allow Direct API Calls: %v\n", config.AllowDirectAPICalls)
 
+	// Security level assessment
+	if !config.RequireAPIKey {
+		fmt.Printf("   ⚠️  SECURITY LEVEL: MINIMAL (No API key required)\n")
+	} else if len(config.AllowedOrigins) == 1 && config.AllowedOrigins[0] == "*" {
+		fmt.Printf("   ⚠️  SECURITY LEVEL: MODERATE (API key + allow all origins)\n")
+	} else if config.AllowDirectAPICalls {
+		fmt.Printf("   🛡️  SECURITY LEVEL: HIGH (API key + origin whitelist + direct calls)\n")
+	} else {
+		fmt.Printf("   🔒 SECURITY LEVEL: MAXIMUM (API key + strict origin whitelist)\n")
+	}
+	
 	// Print CORS configuration
 	if len(config.AllowedOrigins) == 1 && config.AllowedOrigins[0] == "*" {
 		fmt.Printf("   CORS: Allow all origins (*) - ⚠️  PERMISSIVE MODE\n")

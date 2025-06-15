@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -36,6 +37,10 @@ type Config struct {
 	QueueBufferSize     int
 	UploadsDir          string
 	GradingScriptPath   string
+	AllowedOrigins      []string      // CORS whitelist
+	RequireAPIKey       bool          // Enable API key authentication
+	ValidAPIKeys        []string      // Valid API keys
+	AllowDirectAPICalls bool          // Allow requests without Origin/Referer headers
 }
 
 // Job represents a grading job
@@ -87,7 +92,185 @@ var (
 )
 
 //------------------------------------------------------------------------------
-// Functions
+// Security functions
+
+// handleCORS sets appropriate CORS headers based on the configured allowed origins
+func handleCORS(w http.ResponseWriter, r *http.Request) {
+	origin := r.Header.Get("Origin")
+	
+	// If no allowed origins configured, block all CORS requests
+	if len(config.AllowedOrigins) == 0 {
+		return
+	}
+	
+	// Check if origin is allowed
+	allowed := false
+	
+	// Special case: "*" allows all origins
+	if len(config.AllowedOrigins) == 1 && config.AllowedOrigins[0] == "*" {
+		allowed = true
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+	} else {
+		// Check against whitelist
+		for _, allowedOrigin := range config.AllowedOrigins {
+			if origin == allowedOrigin {
+				allowed = true
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				break
+			}
+		}
+	}
+	
+	// Only set additional CORS headers if origin is allowed
+	if allowed {
+		// Allow credentials (cookies, authorization headers, etc.)
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
+		
+		// Specify allowed methods
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		
+		// Specify allowed headers for preflight requests
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, X-API-Key")
+		
+		// Set max age for preflight cache (24 hours)
+		w.Header().Set("Access-Control-Max-Age", "86400")
+		
+		// Expose headers that the client can access
+		w.Header().Set("Access-Control-Expose-Headers", "Content-Length, Content-Type")
+	}
+}
+
+// authenticateRequest validates the API key if authentication is required
+func authenticateRequest(r *http.Request) bool {
+	if !config.RequireAPIKey {
+		return true // Skip auth if disabled
+	}
+	
+	// Check for API key in header
+	apiKey := r.Header.Get("X-API-Key")
+	if apiKey == "" {
+		// Also check Authorization header as Bearer token
+		authHeader := r.Header.Get("Authorization")
+		if strings.HasPrefix(authHeader, "Bearer ") {
+			apiKey = strings.TrimPrefix(authHeader, "Bearer ")
+		}
+	}
+	
+	// Validate against configured API keys
+	for _, validKey := range config.ValidAPIKeys {
+		if apiKey == validKey {
+			return true
+		}
+	}
+	
+	return false
+}
+
+// validateRequestOrigin checks if the request origin is allowed
+func validateRequestOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	referer := r.Header.Get("Referer")
+	
+	// If no origin/referer, it's likely a direct API call
+	if origin == "" && referer == "" {
+		return config.AllowDirectAPICalls
+	}
+	
+	// Check origin against whitelist
+	if origin != "" && isOriginAllowed(origin) {
+		return true
+	}
+	
+	// Check referer against whitelist
+	if referer != "" && isRefererAllowed(referer) {
+		return true
+	}
+	
+	return false
+}
+
+// isOriginAllowed checks if an origin is in the allowed list
+func isOriginAllowed(origin string) bool {
+	if len(config.AllowedOrigins) == 0 {
+		return false
+	}
+	
+	// Special case: "*" allows all origins
+	if len(config.AllowedOrigins) == 1 && config.AllowedOrigins[0] == "*" {
+		return true
+	}
+	
+	// Check against whitelist
+	for _, allowedOrigin := range config.AllowedOrigins {
+		if origin == allowedOrigin {
+			return true
+		}
+	}
+	
+	return false
+}
+
+// isRefererAllowed checks if a referer URL is from an allowed origin
+func isRefererAllowed(referer string) bool {
+	if referer == "" {
+		return false
+	}
+	
+	// Parse the referer URL to get the origin
+	parsedURL, err := url.Parse(referer)
+	if err != nil {
+		return false
+	}
+	
+	// Construct origin from referer (scheme + host)
+	refererOrigin := fmt.Sprintf("%s://%s", parsedURL.Scheme, parsedURL.Host)
+	
+	return isOriginAllowed(refererOrigin)
+}
+
+// securityMiddleware applies all security checks to requests
+func securityMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Debug logging
+		fmt.Printf("🔍 Security check for %s %s\n", r.Method, r.URL.Path)
+		fmt.Printf("   API Key Required: %v\n", config.RequireAPIKey)
+		fmt.Printf("   X-API-Key header: '%s'\n", r.Header.Get("X-API-Key"))
+		fmt.Printf("   Authorization header: '%s'\n", r.Header.Get("Authorization"))
+		
+		// 1. Handle CORS (for browsers)
+		handleCORS(w, r)
+		
+		// Handle preflight requests
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		
+		// 2. Check API key (strongest protection)
+		if !authenticateRequest(r) {
+			fmt.Printf("❌ Authentication failed for %s %s\n", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Invalid or missing API key"})
+			return
+		}
+		
+		// 3. Validate request origin (additional layer)
+		if !validateRequestOrigin(r) {
+			fmt.Printf("❌ Origin validation failed for %s %s\n", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Request origin not allowed"})
+			return
+		}
+		
+		fmt.Printf("✅ Security checks passed for %s %s\n", r.Method, r.URL.Path)
+		
+		// All security checks passed, proceed to handler
+		next(w, r)
+	}
+}
+
+//------------------------------------------------------------------------------
+// Configuration Functions
 
 //  Load server configuration settings
 func loadConfig() *Config {
@@ -104,6 +287,10 @@ func loadConfig() *Config {
 		QueueBufferSize:     getEnvInt("QUEUE_BUFFER_SIZE", 100),
 		UploadsDir:          getEnv("UPLOADS_DIR", "/tmp/uploads"),
 		GradingScriptPath:   getEnv("GRADING_SCRIPT_PATH", "/usr/local/bin/grade.py"),
+		AllowedOrigins:      parseAllowedOrigins(getEnv("ALLOWED_ORIGINS", "*")),
+		RequireAPIKey:       getEnvBool("REQUIRE_API_KEY", false),
+		ValidAPIKeys:        parseAPIKeys(getEnv("VALID_API_KEYS", "")),
+		AllowDirectAPICalls: getEnvBool("ALLOW_DIRECT_API_CALLS", true),
 	}
 	
 	// Convert MB to bytes for file size
@@ -139,6 +326,36 @@ func getEnvInt64(key string, defaultValue int64) int64 {
 	}
 	return defaultValue
 }
+
+// Helper function to get environment variables as boolean
+func getEnvBool(key string, defaultValue bool) bool {
+	if value := os.Getenv(key); value != "" {
+		if boolValue, err := strconv.ParseBool(value); err == nil {
+			return boolValue
+		}
+	}
+	return defaultValue
+}
+
+// parseAPIKeys parses comma-separated API keys
+func parseAPIKeys(keys string) []string {
+	if keys == "" {
+		return []string{}
+	}
+	
+	var apiKeys []string
+	for _, key := range strings.Split(keys, ",") {
+		key = strings.TrimSpace(key)
+		if key != "" {
+			apiKeys = append(apiKeys, key)
+		}
+	}
+	
+	return apiKeys
+}
+
+//------------------------------------------------------------------------------
+// HTTP Handlers
 
 // Accept file uploads and queues them for processing
 func submitHandler(w http.ResponseWriter, r *http.Request) {
@@ -182,7 +399,7 @@ func submitHandler(w http.ResponseWriter, r *http.Request) {
 	// Create uploads directory if it doesn't exist
 	os.MkdirAll(config.UploadsDir, 0755)
 	
-	// Save file to disk
+	// Construct the file path for saving
 	filePath := fmt.Sprintf("%s/%s_%s", config.UploadsDir, jobID, header.Filename)
 	
 	// Read and save file
@@ -193,6 +410,7 @@ func submitHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	
+	// Write file to disk
 	err = os.WriteFile(filePath, fileContents, 0644)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -238,6 +456,7 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Validate job ID format
 	job := jobQueue.getJob(jobID)
 	if job == nil {
 		w.WriteHeader(http.StatusNotFound)
@@ -245,6 +464,7 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check if job is still processing
 	response := StatusResponse{Job: job}
 	json.NewEncoder(w).Encode(response)
 }
@@ -271,7 +491,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
-// cReturn current configuration (for debugging/monitoring)
+// Return current configuration (for debugging/monitoring)
 func configHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	
@@ -285,10 +505,16 @@ func configHandler(w http.ResponseWriter, r *http.Request) {
 		"queue_buffer_size":       config.QueueBufferSize,
 		"uploads_dir":             config.UploadsDir,
 		"grading_script_path":     config.GradingScriptPath,
+		"require_api_key":         config.RequireAPIKey,
+		"allow_direct_api_calls":  config.AllowDirectAPICalls,
+		"api_keys_configured":     len(config.ValidAPIKeys),
 	}
 	
 	json.NewEncoder(w).Encode(configInfo)
 }
+
+//------------------------------------------------------------------------------
+// Job Queue Functions
 
 // Add a job to the queue and map it to its job ID
 func (q *JobQueue) addJob(job *Job) {
@@ -368,6 +594,7 @@ func (q *JobQueue) processJob(jobID string) *JobResult {
 	}
 	defer os.RemoveAll(tempDir) // Always cleanup
 
+	// Log the grading start
 	fmt.Printf("🔬 Starting grading in %s\n", tempDir)
 
 	// Copy student submission to grading directory
@@ -422,6 +649,7 @@ func (q *JobQueue) runPythonGrader(tempDir, submissionPath, originalFilename str
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
+	// Start the grading process
 	fmt.Printf("⚡ Running Python grader: python3 %s %s (timeout: %v)\n", 
 		config.GradingScriptPath, originalFilename, config.GradingTimeout)
 	
@@ -484,9 +712,10 @@ func (q *JobQueue) parseGradingOutput(stdout, stderr string) *JobResult {
 		}
 	}
 	
+	// If parsing the entire stdout fails, log the error
 	fmt.Printf("❌ Failed to parse stdout as JSON directly: %v\n", err)
 	
-	// If that fails, look for JSON line by line
+	// Split stdout into lines and try to find valid JSON
 	lines := strings.Split(stdout, "\n")
 	for i, line := range lines {
 		line = strings.TrimSpace(line)
@@ -591,6 +820,9 @@ func (q *JobQueue) performCleanup() {
 	fmt.Printf("🧹 Cleanup complete: %d files removed, %d jobs removed\n", cleanedFiles, cleanedJobs)
 }
 
+//------------------------------------------------------------------------------
+// Utility Functions
+
 // Generate UUID7-based job ID
 func generateJobID() string {
 
@@ -605,6 +837,30 @@ func generateJobID() string {
 	u := uuid.New()
 
 	return base64.RawURLEncoding.EncodeToString(u[:])
+}
+
+// parseAllowedOrigins parses comma-separated origins and normalizes them
+func parseAllowedOrigins(origins string) []string {
+	if origins == "" {
+		return []string{} // Empty list = no CORS (will block all)
+	}
+	
+	// Special case: "*" means allow all origins
+	if origins == "*" {
+		return []string{"*"}
+	}
+	
+	var allowedOrigins []string
+	for _, origin := range strings.Split(origins, ",") {
+		origin = strings.TrimSpace(origin)
+		if origin != "" {
+			// Normalize the origin (remove trailing slash)
+			origin = strings.TrimSuffix(origin, "/")
+			allowedOrigins = append(allowedOrigins, origin)
+		}
+	}
+	
+	return allowedOrigins
 }
 
 //------------------------------------------------------------------------------
@@ -628,6 +884,33 @@ func main() {
 	fmt.Printf("   Queue buffer size: %d\n", config.QueueBufferSize)
 	fmt.Printf("   Uploads directory: %s\n", config.UploadsDir)
 	fmt.Printf("   Grading script: %s\n", config.GradingScriptPath)
+	
+	// Print security configuration
+	fmt.Printf("   API Key Required: %v\n", config.RequireAPIKey)
+	if config.RequireAPIKey {
+		fmt.Printf("   Valid API Keys: %d configured\n", len(config.ValidAPIKeys))
+		// Debug: Print first few characters of each key for verification
+		for i, key := range config.ValidAPIKeys {
+			if len(key) > 3 {
+				fmt.Printf("     Key %d: %s... (%d chars)\n", i+1, key[:3], len(key))
+			} else {
+				fmt.Printf("     Key %d: %s (%d chars)\n", i+1, key, len(key))
+			}
+		}
+	}
+	fmt.Printf("   Allow Direct API Calls: %v\n", config.AllowDirectAPICalls)
+
+	// Print CORS configuration
+	if len(config.AllowedOrigins) == 1 && config.AllowedOrigins[0] == "*" {
+		fmt.Printf("   CORS: Allow all origins (*) - ⚠️  PERMISSIVE MODE\n")
+	} else if len(config.AllowedOrigins) == 0 {
+		fmt.Printf("   CORS: Block all origins - 🔒 MAXIMUM SECURITY\n")
+	} else {
+		fmt.Printf("   CORS: Restricted to %d origin(s) - 🛡️  SECURE MODE:\n", len(config.AllowedOrigins))
+		for _, origin := range config.AllowedOrigins {
+			fmt.Printf("     - %s\n", origin)
+		}
+	}
 	fmt.Println()
 
 	// Initialize queue with configured buffer size
@@ -643,22 +926,38 @@ func main() {
 	// Create uploads directory
 	os.MkdirAll(config.UploadsDir, 0755)
 
-	// API endpoints
-	http.HandleFunc("/submit", submitHandler)
-	http.HandleFunc("/status/", statusHandler)
-	http.HandleFunc("/queue", queueStatusHandler)
-	http.HandleFunc("/health", healthHandler)
-	http.HandleFunc("/config", configHandler)
+	// Create a custom mux to handle CORS globally
+	mux := http.NewServeMux()
+	
+	// API endpoints with security middleware
+	mux.HandleFunc("/submit", securityMiddleware(submitHandler))
+	mux.HandleFunc("/status/", securityMiddleware(statusHandler))
+	mux.HandleFunc("/queue", securityMiddleware(queueStatusHandler))
+	mux.HandleFunc("/config", securityMiddleware(configHandler))
+	
+	// Health endpoint without security (for load balancer checks)
+	mux.HandleFunc("/health", healthHandler)
 
-	// Print server startup information
-	fmt.Printf("🌐 Starting Bytegrader API on port %s...\n", config.Port)
-	fmt.Println("Endpoints:")
+	// Print API startup information
+	fmt.Printf("🚀 ByteGrader API running on port %s\n", config.Port)
+	fmt.Println("📋 Endpoints:")
 	fmt.Println("  POST /submit - Submit file for grading (returns job_id)")
 	fmt.Println("  GET  /status/{job_id} - Check job status")
 	fmt.Println("  GET  /queue - View queue status")
 	fmt.Println("  GET  /config - View current configuration")
-	fmt.Println("  GET  /health - Health check")
+	fmt.Println("  GET  /health - Health check (no auth required)")
+	
+	// Print security information
+	if config.RequireAPIKey {
+		fmt.Println("\n🔐 Security Information:")
+		fmt.Println("  API key required for all endpoints except /health")
+		fmt.Println("  Send API key in 'X-API-Key' header or 'Authorization: Bearer {key}'")
+		fmt.Printf("  Direct API calls allowed: %v\n", config.AllowDirectAPICalls)
+	} else {
+		fmt.Println("\n⚠️  WARNING: API key authentication is DISABLED")
+		fmt.Println("  Set REQUIRE_API_KEY=true for production use")
+	}
 	
 	// Start the server
-	log.Fatal(http.ListenAndServe(":"+config.Port, nil))
+	log.Fatal(http.ListenAndServe(":"+config.Port, mux))
 }

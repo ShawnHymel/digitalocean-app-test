@@ -8,13 +8,20 @@ To test the application locally:
 
 ```sh
 docker build -t digitalocean-app-test .
-docker run -p 8080:8080 -e GRADING_TIMEOUT_MIN=10 -e MAX_FILE_SIZE_MB=100 digitalocean-app-test
+docker run -p 8080:8080 \
+    -e REQUIRE_API_KEY=true \
+    -e VALID_API_KEYS="test-key-123" \
+    -e ALLOWED_ORIGINS="http://localhost:8080" \
+    -e ALLOW_DIRECT_API_CALLS=true \
+    -e GRADING_TIMEOUT_MIN=10 \
+    -e MAX_FILE_SIZE_MB=100 \
+    digitalocean-app-test
 ```
 
 Use `curl` to send `test/submission.zip`:
 
 ```sh
-curl -X POST -F "file=@test/submission.zip" http://localhost:8080/submit
+curl -X POST -H "X-API-Key: test-key-123" -F "file=@test/submission.zip" http://localhost:8080/submit
 ```
 
 Copy the `job_id` from the respones.
@@ -22,10 +29,12 @@ Copy the `job_id` from the respones.
 Do a GET request to get grading status (or browse to *http://localhost:8080/status/<JOB_ID>*):
 
 ```sh
- curl http://localhost:8080/status/<JOB_ID>
+curl -H "X-API-Key: test-key-123" http://localhost:8080/status/<JOB_ID>
 ```
 
 You should get a JSON response with `"status": "completed"` and a `"result"` field filled out by the dummy grader (*grade.py*).
+
+To test the 
 
 ## Initialize App on DigitalOcean (First Deploy)
 

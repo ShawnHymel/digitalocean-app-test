@@ -33,9 +33,8 @@ RUN python3 -m pip install --no-cache-dir \
 WORKDIR /app
 COPY --from=builder /app/bytegrader-api .
 
-# Copy only the Python grading script
-COPY grade.py /usr/local/bin/grade.py
-RUN chmod +x /usr/local/bin/grade.py
+# Copy the grading scripts
+COPY graders/ /usr/local/bin/graders
 
 # Create uploads directory
 RUN mkdir -p /tmp/uploads

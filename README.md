@@ -59,9 +59,21 @@ git checkout main
  10. Give your app a name (e.g. `addition-app`)
  11. Click **Create app**
 
-You should see "Building..." on the next page. After a few minutes, you should be able to try out your application.
+You should see "Building..." on the next page. You will need to change some environment variables in the container to make the app work. Click the **Settings** tab and click **Edit** for *App-Level Environment Variables*. Add the relevant environment variables. For example:
 
-In a browser, go to the link given at the top of the app page along with any query modifiers (e.g. `https://my-app-dsyyq.ondigitalocean.app/add?a=3.5&b=2.1`) or files (e.g. `curl -X POST -F "file=@test.txt" https://my-app-dsyyq.ondigitalocean.app/upload`). You should see the response from your app.
+ * `REQUIRE_API_KEY`: `true`
+ * `VALID_API_KEYS`: `my-api-key-123` (copy this and set to encrypted)
+ * `ALLOWED_IPS`: `x.x.x.x,y:y:y:y::/64` (do a manual DNS lookup for your intended client host)
+ * `GRADING_TIMEOUT_MIN`: `10`
+ * `MAX_FILE_SIZE_MB`: `100`
+
+Save, and after a few minutes, you should be able to try out your application.
+
+Copy the [example widget HTML](widget/test-widget.html) to your web page (e.g. in an HTML block on a WordPress site). Change `API_ENDPOINT` in that code to match your DigitalOcean app URL, and change `API_KEY` to the key you set earlier (e.g. `my-api-key-123`).
+
+Save and refresh the page. Choose *test/submission.zip* and click **Submit**. The server should accept your file and give you a dummy score in a few seconds.
+
+> **IMPORTANT!** The server uses strict IP address whitelisting. If you want to test from another client, you will need to add your public IP address to the `ALLOWED_IPS` list.
 
 ## Deploy Updates
 

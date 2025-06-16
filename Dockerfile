@@ -5,7 +5,7 @@
 # --- Stage 1: Build the Go binary ---
 
 # Use a lightweight Go image for building the application
-FROM golang:1.21-alpine AS builder
+FROM golang:1.24-alpine AS builder
 WORKDIR /app
 
 # Copy Go module files first (for better caching)
@@ -21,8 +21,13 @@ RUN go build -o bytegrader-api .
 # Production image with Python for grading
 FROM python:3.12-slim
 RUN apt-get update && apt-get install -y \
-    ca-certificates \
+        ca-certificates \
+        libmagic1 \
     && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies
+RUN python3 -m pip install --no-cache-dir \
+        python-magic
 
 # Copy the Go binary from builder stage
 WORKDIR /app

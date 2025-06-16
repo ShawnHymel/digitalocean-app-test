@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"golang.org/x/time/rate"
 )
 
 //------------------------------------------------------------------------------
@@ -27,6 +28,8 @@ import (
 
 // Configuration struct to hold all configurable parameters
 type Config struct {
+
+	// Server configuration
 	Port                string
 	MaxFileSize         int64         // MB
 	GradingTimeout      time.Duration // minutes
@@ -37,9 +40,20 @@ type Config struct {
 	QueueBufferSize     int
 	UploadsDir          string
 	GradingScriptPath   string
+
+	// Security configuration
 	RequireAPIKey       bool          // Enable API key authentication
 	ValidAPIKeys        []string      // Valid API keys
 	AllowedIPs          []string      // IP whitelist for maximum security
+
+	// Rate limiting configuration
+	RateLimitEnabled    bool          // Enable rate limiting
+	RateLimitRequests   int           // Requests per window
+	RateLimitWindow     time.Duration // Time window for rate limiting
+	
+	// Resource limits
+	MaxConcurrentJobs   int           // Maximum concurrent grading jobs
+	MaxQueueSize        int           // Maximum queued jobs
 }
 
 // Job represents a grading job
@@ -68,27 +82,129 @@ type SubmitResponse struct {
 	Message string `json:"message"`
 }
 
+// Job status response
 type StatusResponse struct {
 	Job *Job `json:"job"`
 }
 
+// Job error response
 type ErrorResponse struct {
 	Error string `json:"error"`
 }
 
 // Simple in-memory queue
 type JobQueue struct {
-	jobs      map[string]*Job
-	queue     chan string
-	mutex     sync.RWMutex
-	isRunning bool
+	jobs            map[string]*Job
+	queue           chan string
+	mutex           sync.RWMutex
+	isRunning       bool
+	activeJobs      int           // Current number of processing jobs
+	activeJobsMutex sync.Mutex    // Mutex for activeJobs counter
+}
+
+// Rate limiter storage
+type RateLimitManager struct {
+	limiters map[string]*rate.Limiter
+	mutex    sync.RWMutex
 }
 
 // Global variables
 var (
-	config   *Config
-	jobQueue *JobQueue
+	config           *Config
+	jobQueue         *JobQueue
+	rateLimitManager *RateLimitManager
 )
+
+//------------------------------------------------------------------------------
+// Rate Limiting Functions
+
+// Initialize rate limit manager
+func newRateLimitManager() *RateLimitManager {
+	return &RateLimitManager{
+		limiters: make(map[string]*rate.Limiter),
+	}
+}
+
+// Get or create rate limiter for IP
+func (rlm *RateLimitManager) getLimiter(ip string) *rate.Limiter {
+	rlm.mutex.Lock()
+	defer rlm.mutex.Unlock()
+	
+	limiter, exists := rlm.limiters[ip]
+	if !exists {
+		// Create new limiter with burst = maxRequests and refill rate
+		// Rate: requests per window converted to requests per second
+		requestsPerSecond := float64(config.RateLimitRequests) / config.RateLimitWindow.Seconds()
+		limiter = rate.NewLimiter(rate.Limit(requestsPerSecond), config.RateLimitRequests)
+		rlm.limiters[ip] = limiter
+		
+		fmt.Printf("🚦 Created rate limiter for IP %s: %.4f req/sec, burst %d\n", 
+			ip, requestsPerSecond, config.RateLimitRequests)
+	}
+	
+	return limiter
+}
+
+// Clean up old limiters periodically
+func (rlm *RateLimitManager) cleanup() {
+	ticker := time.NewTicker(time.Hour) // Clean up every hour
+	defer ticker.Stop()
+	
+	// Clean up unused limiters
+	for {
+		select {
+		case <-ticker.C:
+			rlm.mutex.Lock()
+			
+			// Remove limiters that haven't been used recently
+			for ip, limiter := range rlm.limiters {
+
+				// If limiter has full tokens, it hasn't been used recently
+				if limiter.Tokens() >= float64(config.RateLimitRequests) {
+					delete(rlm.limiters, ip)
+				}
+			}
+			
+			rlm.mutex.Unlock()
+			fmt.Printf("🧹 Cleaned up unused rate limiters\n")
+		}
+	}
+}
+
+// Rate limiting middleware
+func rateLimitMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		fmt.Printf("🚦 Rate limiting middleware called for %s %s\n", r.Method, r.URL.Path)
+		
+		if !config.RateLimitEnabled {
+			fmt.Printf("🚦 Rate limiting is DISABLED\n")
+			next(w, r)
+			return
+		}
+		
+		clientIP := getClientIP(r)
+		limiter := rateLimitManager.getLimiter(clientIP)
+		
+		// Debug: Show current limiter state
+		fmt.Printf("🚦 Rate check for IP %s: tokens=%.2f, limit=%.4f\n", 
+			clientIP, limiter.Tokens(), float64(limiter.Limit()))
+		
+		if !limiter.Allow() {
+			fmt.Printf("❌ Rate limit exceeded for IP: %s\n", clientIP)
+			w.WriteHeader(http.StatusTooManyRequests)
+			json.NewEncoder(w).Encode(ErrorResponse{
+				Error: fmt.Sprintf("Rate limit exceeded. Maximum %d requests per %v allowed.", 
+					config.RateLimitRequests, config.RateLimitWindow),
+			})
+			return
+		}
+		
+		fmt.Printf("✅ Rate limit passed for IP: %s (tokens remaining: %.2f)\n", 
+			clientIP, limiter.Tokens())
+		
+		next(w, r)
+	}
+}
 
 //------------------------------------------------------------------------------
 // Security Functions
@@ -131,9 +247,11 @@ func authenticateRequest(r *http.Request) bool {
 
 // Extract client IP from request headers
 func getClientIP(r *http.Request) string {
+	
 	// Check X-Forwarded-For header (most common for proxies/load balancers)
 	xff := r.Header.Get("X-Forwarded-For")
 	if xff != "" {
+
 		// X-Forwarded-For can contain multiple IPs, take the first one
 		ips := strings.Split(xff, ",")
 		return strings.TrimSpace(ips[0])
@@ -239,6 +357,11 @@ func securityMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// Combined middleware that applies rate limiting and security
+func protectedEndpoint(handler http.HandlerFunc) http.HandlerFunc {
+	return securityMiddleware(rateLimitMiddleware(handler))
+}
+
 //------------------------------------------------------------------------------
 // Configuration Functions
 
@@ -247,6 +370,8 @@ func loadConfig() *Config {
 
 	// Load configuration from environment variables with defaults
 	config := &Config{
+
+		// Server configuration
 		Port:                getEnv("PORT", "8080"),
 		MaxFileSize:         getEnvInt64("MAX_FILE_SIZE_MB", 50),
 		GradingTimeout:      time.Duration(getEnvInt("GRADING_TIMEOUT_MIN", 5)) * time.Minute,
@@ -257,9 +382,20 @@ func loadConfig() *Config {
 		QueueBufferSize:     getEnvInt("QUEUE_BUFFER_SIZE", 100),
 		UploadsDir:          getEnv("UPLOADS_DIR", "/tmp/uploads"),
 		GradingScriptPath:   getEnv("GRADING_SCRIPT_PATH", "/usr/local/bin/grade.py"),
+		
+		// Security configuration
 		RequireAPIKey:       getEnvBool("REQUIRE_API_KEY", false),
 		ValidAPIKeys:        parseAPIKeys(getEnv("VALID_API_KEYS", "")),
 		AllowedIPs:          parseAllowedIPs(getEnv("ALLOWED_IPS", "")),
+		
+		// Rate limiting configuration
+		RateLimitEnabled:    getEnvBool("RATE_LIMIT_ENABLED", true),
+		RateLimitRequests:   getEnvInt("RATE_LIMIT_REQUESTS", 10),
+		RateLimitWindow:     time.Duration(getEnvInt("RATE_LIMIT_WINDOW_MINUTES", 5)) * time.Minute,
+		
+		// Resource limits
+		MaxConcurrentJobs:   getEnvInt("MAX_CONCURRENT_JOBS", 3),
+		MaxQueueSize:        getEnvInt("MAX_QUEUE_SIZE", 50),
 	}
 	
 	// Convert MB to bytes for file size
@@ -445,10 +581,17 @@ func queueStatusHandler(w http.ResponseWriter, r *http.Request) {
 	queueLength := len(jobQueue.queue)
 	totalJobs := len(jobQueue.jobs)
 	
+	jobQueue.activeJobsMutex.Lock()
+	activeJobs := jobQueue.activeJobs
+	jobQueue.activeJobsMutex.Unlock()
+	
 	response := map[string]interface{}{
-		"queue_length": queueLength,
-		"total_jobs":   totalJobs,
-		"worker_running": jobQueue.isRunning,
+		"queue_length":    queueLength,
+		"total_jobs":      totalJobs,
+		"active_jobs":     activeJobs,
+		"max_queue_size":  config.MaxQueueSize,
+		"max_concurrent":  config.MaxConcurrentJobs,
+		"worker_running":  jobQueue.isRunning,
 	}
 	
 	json.NewEncoder(w).Encode(response)
@@ -478,6 +621,11 @@ func configHandler(w http.ResponseWriter, r *http.Request) {
 		"ip_whitelist_enabled":    len(config.AllowedIPs) > 0,
 		"allowed_ips_count":       len(config.AllowedIPs),
 		"api_keys_configured":     len(config.ValidAPIKeys),
+		"rate_limit_enabled":      config.RateLimitEnabled,
+		"rate_limit_requests":     config.RateLimitRequests,
+		"rate_limit_window_min":   int(config.RateLimitWindow.Minutes()),
+		"max_concurrent_jobs":     config.MaxConcurrentJobs,
+		"max_queue_size":          config.MaxQueueSize,
 	}
 	
 	json.NewEncoder(w).Encode(configInfo)
@@ -520,32 +668,56 @@ func (q *JobQueue) updateJob(jobID string, status string, result *JobResult) {
 // Worker that processes jobs one by one
 func (q *JobQueue) startWorker() {
 	q.isRunning = true
-	fmt.Println("🔄 Worker started - processing jobs...")
+	fmt.Printf("🔄 Worker started - processing jobs (max concurrent: %d)...\n", config.MaxConcurrentJobs)
 	
+	// Create a semaphore to limit concurrent jobs
+	semaphore := make(chan struct{}, config.MaxConcurrentJobs)
+	
+	// Process jobs from the queue
 	for jobID := range q.queue {
-		fmt.Printf("⚡ Processing job %s...\n", jobID)
+
+		// Wait for available slot
+		semaphore <- struct{}{}
 		
-		// Update status to processing
-		q.updateJob(jobID, "processing", nil)
+		// Increment active jobs counter
+		q.activeJobsMutex.Lock()
+		q.activeJobs++
+		q.activeJobsMutex.Unlock()
 		
-		// Simulate grading work (replace with actual grading logic)
-		result := q.processJob(jobID)
-		
-		// Update with result and cleanup file if failed
-		if result.Error != "" {
-			q.updateJob(jobID, "failed", result)
-			fmt.Printf("❌ Job %s failed: %s\n", jobID, result.Error)
+		go func(jobID string) {
+			defer func() {
+				// Release semaphore slot
+				<-semaphore
+				
+				// Decrement active jobs counter
+				q.activeJobsMutex.Lock()
+				q.activeJobs--
+				q.activeJobsMutex.Unlock()
+			}()
 			
-			// Clean up file for failed jobs
-			job := q.getJob(jobID)
-			if job != nil {
-				q.cleanupFile(job.FilePath, jobID, "job failed")
+			fmt.Printf("⚡ Processing job %s... (active: %d/%d)\n", jobID, q.activeJobs, config.MaxConcurrentJobs)
+			
+			// Update status to processing
+			q.updateJob(jobID, "processing", nil)
+			
+			// Process the job
+			result := q.processJob(jobID)
+			
+			// Update with result and cleanup file if failed
+			if result.Error != "" {
+				q.updateJob(jobID, "failed", result)
+				fmt.Printf("❌ Job %s failed: %s\n", jobID, result.Error)
+				
+				// Clean up file for failed jobs
+				job := q.getJob(jobID)
+				if job != nil {
+					q.cleanupFile(job.FilePath, jobID, "job failed")
+				}
+			} else {
+				q.updateJob(jobID, "completed", result)
+				fmt.Printf("✅ Job %s completed (Score: %.1f)\n", jobID, result.Score)
 			}
-		} else {
-			q.updateJob(jobID, "completed", result)
-			fmt.Printf("✅ Job %s completed (Score: %.1f)\n", jobID, result.Score)
-			// File cleanup happens in processJob for successful jobs
-		}
+		}(jobID)
 	}
 }
 
@@ -809,7 +981,7 @@ func generateJobID() string {
 	return base64.RawURLEncoding.EncodeToString(u[:])
 }
 
-// parseAllowedIPs parses comma-separated IP addresses and CIDR blocks
+// Parse comma-separated IP addresses and CIDR blocks
 func parseAllowedIPs(ips string) []string {
 	if ips == "" {
 		return []string{}
@@ -847,9 +1019,16 @@ func main() {
 	fmt.Printf("   Queue buffer size: %d\n", config.QueueBufferSize)
 	fmt.Printf("   Uploads directory: %s\n", config.UploadsDir)
 	fmt.Printf("   Grading script: %s\n", config.GradingScriptPath)
+	fmt.Printf("   Max concurrent jobs: %d\n", config.MaxConcurrentJobs)
+	fmt.Printf("   Max Queue Size: %d\n", config.MaxQueueSize)
+	fmt.Printf("   Uploads Directory: %s (files will be stored here)\n", config.UploadsDir)
+	fmt.Printf("   Grading Script Path: %s (Python script for grading)\n", config.GradingScriptPath)
+	fmt.Println("")
 	
 	// Print security configuration
-	fmt.Printf("   🔐 SECURITY CONFIGURATION:\n")
+	fmt.Printf("🔐 SECURITY CONFIGURATION:\n")
+
+	// Print API key configuration
 	fmt.Printf("   API Key Required: %v\n", config.RequireAPIKey)
 	if config.RequireAPIKey {
 		fmt.Printf("   Valid API Keys: %d configured\n", len(config.ValidAPIKeys))
@@ -863,16 +1042,35 @@ func main() {
 		}
 	}
 
+	// Print note about API key usage
+	if config.RequireAPIKey {
+		fmt.Println("   API key required for all endpoints except /health")
+		fmt.Println("   Send API key in 'X-API-Key' header or 'Authorization: Bearer {key}'")
+	} else {
+		fmt.Println("   ⚠️  WARNING: API key authentication is DISABLED")
+		fmt.Println("   Set REQUIRE_API_KEY=true for production use")
+	}
+
 	// Print IP whitelist configuration
 	if len(config.AllowedIPs) == 0 {
 		fmt.Printf("   IP Whitelist: DISABLED (allow all IPs) - ⚠️  DEVELOPMENT ONLY\n")
 	} else {
-		fmt.Printf("   IP Whitelist: %d IP(s) configured - 🔒 MAXIMUM SECURITY:\n", len(config.AllowedIPs))
+		fmt.Printf("   IP Whitelist: %d IP(s) configured\n", len(config.AllowedIPs))
 		for _, ip := range config.AllowedIPs {
 			fmt.Printf("     - %s\n", ip)
 		}
 	}
 
+	// Print CORS information
+	fmt.Printf("   Note: CORS is permissive because IP whitelist provides primary security\n")
+
+	// Print rate limiting configuration
+	if config.RateLimitEnabled {
+		fmt.Printf("   Rate Limiting: ENABLED (%d requests per %v)\n", config.RateLimitRequests, config.RateLimitWindow)
+	} else {
+		fmt.Printf("   Rate Limiting: DISABLED (no limits on requests) - ⚠️  DEVELOPMENT ONLY\n")
+	}
+	
 	// Security level assessment
 	if !config.RequireAPIKey && len(config.AllowedIPs) == 0 {
 		fmt.Printf("   ⚠️  SECURITY LEVEL: NONE (No protection) - DEVELOPMENT ONLY\n")
@@ -883,11 +1081,7 @@ func main() {
 	} else {
 		fmt.Printf("   🔒 SECURITY LEVEL: MAXIMUM (API key + IP whitelist)\n")
 	}
-	
-	// Print CORS configuration
-	fmt.Printf("   CORS: Permissive (allow all origins) - 🌐 BROWSER COMPATIBLE\n")
-	fmt.Printf("   Note: CORS is permissive because IP whitelist provides primary security\n")
-	fmt.Println()
+	fmt.Println("")
 
 	// Initialize queue with configured buffer size
 	jobQueue = &JobQueue{
@@ -895,9 +1089,13 @@ func main() {
 		queue: make(chan string, config.QueueBufferSize),
 	}
 
-	// Start the worker and cleanup routines
+	// Initialize rate limit manager
+	rateLimitManager = newRateLimitManager()
+
+	// Start background services
 	go jobQueue.startWorker()
 	go jobQueue.startCleanup()
+	go rateLimitManager.cleanup() // Clean up old rate limiters
 
 	// Create uploads directory
 	os.MkdirAll(config.UploadsDir, 0755)
@@ -905,11 +1103,11 @@ func main() {
 	// Create a custom mux to handle CORS globally
 	mux := http.NewServeMux()
 	
-	// API endpoints with security middleware
-	mux.HandleFunc("/submit", securityMiddleware(submitHandler))
-	mux.HandleFunc("/status/", securityMiddleware(statusHandler))
-	mux.HandleFunc("/queue", securityMiddleware(queueStatusHandler))
-	mux.HandleFunc("/config", securityMiddleware(configHandler))
+	// API endpoints with security and rate limiting
+	mux.HandleFunc("/submit", protectedEndpoint(submitHandler))
+	mux.HandleFunc("/status/", protectedEndpoint(statusHandler))
+	mux.HandleFunc("/queue", protectedEndpoint(queueStatusHandler))
+	mux.HandleFunc("/config", protectedEndpoint(configHandler))
 	
 	// Health endpoint without security (for load balancer checks)
 	mux.HandleFunc("/health", healthHandler)
@@ -917,21 +1115,12 @@ func main() {
 	// Print API startup information
 	fmt.Printf("🚀 ByteGrader API running on port %s\n", config.Port)
 	fmt.Println("📋 Endpoints:")
-	fmt.Println("  POST /submit - Submit file for grading (returns job_id)")
-	fmt.Println("  GET  /status/{job_id} - Check job status")
-	fmt.Println("  GET  /queue - View queue status")
-	fmt.Println("  GET  /config - View current configuration")
-	fmt.Println("  GET  /health - Health check (no auth required)")
-	
-	// Print security information
-	if config.RequireAPIKey {
-		fmt.Println("\n🔐 Security Information:")
-		fmt.Println("  API key required for all endpoints except /health")
-		fmt.Println("  Send API key in 'X-API-Key' header or 'Authorization: Bearer {key}'")
-	} else {
-		fmt.Println("\n⚠️  WARNING: API key authentication is DISABLED")
-		fmt.Println("  Set REQUIRE_API_KEY=true for production use")
-	}
+	fmt.Println("   POST /submit - Submit file for grading (returns job_id)")
+	fmt.Println("   GET  /status/{job_id} - Check job status")
+	fmt.Println("   GET  /queue - View queue status")
+	fmt.Println("   GET  /config - View current configuration")
+	fmt.Println("   GET  /health - Health check (no auth required)")
+	fmt.Println("")
 	
 	// Start the server
 	log.Fatal(http.ListenAndServe(":"+config.Port, mux))

@@ -95,6 +95,14 @@ git checkout main
  3. Click your **app** (e.g. "digitalocean-app-test")
  3. Click **Actions > Destroy App**
 
+## Update Go Modules
+
+If you need to update to a new version of Go or a Go module, you'll want to generate a new *go.mod* and *go.sum*. Use `go mod tidy` in a dummy container:
+
+```sh
+docker run --rm -v "$PWD":/app -w /app golang:1.24 go mod tidy
+```
+
 ## License
 
 I can't promise any of the code in here works or is safe. But if you really want to use it, it is licensed under the [Zero-Clause BSD license](https://opensource.org/license/0bsd).

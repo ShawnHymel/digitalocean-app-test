@@ -8,8 +8,8 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -37,10 +37,9 @@ type Config struct {
 	QueueBufferSize     int
 	UploadsDir          string
 	GradingScriptPath   string
-	AllowedOrigins      []string      // Origin whitelist (used for both CORS and request validation)
 	RequireAPIKey       bool          // Enable API key authentication
 	ValidAPIKeys        []string      // Valid API keys
-	AllowDirectAPICalls bool          // Allow requests without Origin/Referer headers
+	AllowedIPs          []string      // IP whitelist for maximum security
 }
 
 // Job represents a grading job
@@ -92,55 +91,19 @@ var (
 )
 
 //------------------------------------------------------------------------------
-// Security functions
+// Security Functions
 
-// handleCORS sets appropriate CORS headers based on the configured allowed origins
-func handleCORS(w http.ResponseWriter, r *http.Request) {
-	origin := r.Header.Get("Origin")
-	
-	// If no allowed origins configured, block all CORS requests
-	if len(config.AllowedOrigins) == 0 {
-		return
-	}
-	
-	// Check if origin is allowed
-	allowed := false
-	
-	// Special case: "*" allows all origins
-	if len(config.AllowedOrigins) == 1 && config.AllowedOrigins[0] == "*" {
-		allowed = true
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-	} else {
-		// Check against whitelist
-		for _, allowedOrigin := range config.AllowedOrigins {
-			if origin == allowedOrigin {
-				allowed = true
-				w.Header().Set("Access-Control-Allow-Origin", origin)
-				break
-			}
-		}
-	}
-	
-	// Only set additional CORS headers if origin is allowed
-	if allowed {
-		// Allow credentials (cookies, authorization headers, etc.)
-		w.Header().Set("Access-Control-Allow-Credentials", "true")
-		
-		// Specify allowed methods
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		
-		// Specify allowed headers for preflight requests
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, X-API-Key")
-		
-		// Set max age for preflight cache (24 hours)
-		w.Header().Set("Access-Control-Max-Age", "86400")
-		
-		// Expose headers that the client can access
-		w.Header().Set("Access-Control-Expose-Headers", "Content-Length, Content-Type")
-	}
+// Set permissive CORS headers for browser compatibility (as we use IP whitelisting)
+func setCORSHeaders(w http.ResponseWriter) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Credentials", "true")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, X-API-Key")
+	w.Header().Set("Access-Control-Max-Age", "86400")
+	w.Header().Set("Access-Control-Expose-Headers", "Content-Length, Content-Type")
 }
 
-// authenticateRequest validates the API key if authentication is required
+// Validate the API key if authentication is required
 func authenticateRequest(r *http.Request) bool {
 	if !config.RequireAPIKey {
 		return true // Skip auth if disabled
@@ -166,91 +129,86 @@ func authenticateRequest(r *http.Request) bool {
 	return false
 }
 
-// Check if the request origin is allowed (whitelist validation)
-func validateRequestOrigin(r *http.Request) bool {
-	origin := r.Header.Get("Origin")
-	referer := r.Header.Get("Referer")
-	
-	// Special case: "*" allows everything (development only)
-	if len(config.AllowedOrigins) == 1 && config.AllowedOrigins[0] == "*" {
-		return true
+// Extract client IP from request headers
+func getClientIP(r *http.Request) string {
+	// Check X-Forwarded-For header (most common for proxies/load balancers)
+	xff := r.Header.Get("X-Forwarded-For")
+	if xff != "" {
+		// X-Forwarded-For can contain multiple IPs, take the first one
+		ips := strings.Split(xff, ",")
+		return strings.TrimSpace(ips[0])
 	}
 	
-	// Special case: Empty allowed origins = block everything except localhost
-	if len(config.AllowedOrigins) == 0 {
-		return false
+	// Check X-Real-IP header (used by some proxies)
+	realIP := r.Header.Get("X-Real-IP")
+	if realIP != "" {
+		return realIP
 	}
 	
-	// Check 1: Browser request with Origin header
-	if origin != "" {
-		return isOriginAllowed(origin)
+	// Check CF-Connecting-IP header (Cloudflare)
+	cfIP := r.Header.Get("CF-Connecting-IP")
+	if cfIP != "" {
+		return cfIP
 	}
 	
-	// Check 2: Request with Referer header (some API clients send this)
-	if referer != "" {
-		return isRefererAllowed(referer)
+	// Fall back to RemoteAddr (direct connection)
+	ip, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr // Return as-is if parsing fails
 	}
 	
-	// Check 3: Direct API calls (no Origin/Referer)
-	// Rely on API key authentication for security
-	if config.AllowDirectAPICalls {
-		return true 
-	}
-	
-	// No valid origin/referer and direct calls disabled = block
-	return false
+	return ip
 }
 
-// Check if an origin is in the allowed list
-func isOriginAllowed(origin string) bool {
-	if len(config.AllowedOrigins) == 0 {
-		return false
+// Check if the request comes from an allowed IP
+func validateSourceIP(r *http.Request) bool {
+	// If no IP whitelist configured, allow all IPs
+	if len(config.AllowedIPs) == 0 {
+		return true
 	}
 	
-	// Special case: "*" allows all origins
-	if len(config.AllowedOrigins) == 1 && config.AllowedOrigins[0] == "*" {
-		return true
+	clientIP := getClientIP(r)
+	
+	// Special case: allow localhost for development
+	if clientIP == "127.0.0.1" || clientIP == "::1" || clientIP == "localhost" {
+		
+		// Only allow localhost if explicitly configured
+		for _, allowedIP := range config.AllowedIPs {
+			if allowedIP == "127.0.0.1" || allowedIP == "localhost" {
+				return true
+			}
+		}
 	}
 	
 	// Check against whitelist
-	for _, allowedOrigin := range config.AllowedOrigins {
-		if origin == allowedOrigin {
+	for _, allowedIP := range config.AllowedIPs {
+		if clientIP == allowedIP {
 			return true
+		}
+		
+		// Check if it's a CIDR block (e.g., 192.168.1.0/24)
+		if strings.Contains(allowedIP, "/") {
+			_, ipNet, err := net.ParseCIDR(allowedIP)
+			if err == nil && ipNet.Contains(net.ParseIP(clientIP)) {
+				return true
+			}
 		}
 	}
 	
 	return false
 }
 
-// isRefererAllowed checks if a referer URL is from an allowed origin
-func isRefererAllowed(referer string) bool {
-	if referer == "" {
-		return false
-	}
-	
-	// Parse the referer URL to get the origin
-	parsedURL, err := url.Parse(referer)
-	if err != nil {
-		return false
-	}
-	
-	// Construct origin from referer (scheme + host)
-	refererOrigin := fmt.Sprintf("%s://%s", parsedURL.Scheme, parsedURL.Host)
-	
-	return isOriginAllowed(refererOrigin)
-}
-
 // securityMiddleware applies all security checks to requests
 func securityMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Debug logging
-		fmt.Printf("🔍 Security check for %s %s\n", r.Method, r.URL.Path)
+		clientIP := getClientIP(r)
+		fmt.Printf("🔍 Security check for %s %s from IP: %s\n", r.Method, r.URL.Path, clientIP)
 		fmt.Printf("   API Key Required: %v\n", config.RequireAPIKey)
 		fmt.Printf("   X-API-Key header: '%s'\n", r.Header.Get("X-API-Key"))
-		fmt.Printf("   Authorization header: '%s'\n", r.Header.Get("Authorization"))
 		
-		// 1. Handle CORS (for browsers)
-		handleCORS(w, r)
+		// 1. Set CORS headers for browser compatibility
+		setCORSHeaders(w)
 		
 		// Handle preflight requests
 		if r.Method == "OPTIONS" {
@@ -258,7 +216,15 @@ func securityMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		
-		// 2. Check API key (strongest protection)
+		// 2. Check IP whitelist (primary security)
+		if !validateSourceIP(r) {
+			fmt.Printf("❌ IP validation failed for %s %s from %s\n", r.Method, r.URL.Path, clientIP)
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "IP address not allowed"})
+			return
+		}
+		
+		// 3. Check API key (authentication)
 		if !authenticateRequest(r) {
 			fmt.Printf("❌ Authentication failed for %s %s\n", r.Method, r.URL.Path)
 			w.WriteHeader(http.StatusUnauthorized)
@@ -266,17 +232,7 @@ func securityMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		
-		// 3. Validate request origin (additional layer)
-		if !validateRequestOrigin(r) {
-			
-			// Log the blocked request and respond with 403 Forbidden
-			fmt.Printf("❌ Request blocked due to invalid origin: %s\n", r.Header.Get("Origin"))
-			w.WriteHeader(http.StatusForbidden)
-			json.NewEncoder(w).Encode(ErrorResponse{Error: "Request origin not allowed"})
-			return
-		}
-		
-		fmt.Printf("✅ Security checks passed for %s %s\n", r.Method, r.URL.Path)
+		fmt.Printf("✅ All security checks passed for %s %s from %s\n", r.Method, r.URL.Path, clientIP)
 		
 		// All security checks passed, proceed to handler
 		next(w, r)
@@ -301,10 +257,9 @@ func loadConfig() *Config {
 		QueueBufferSize:     getEnvInt("QUEUE_BUFFER_SIZE", 100),
 		UploadsDir:          getEnv("UPLOADS_DIR", "/tmp/uploads"),
 		GradingScriptPath:   getEnv("GRADING_SCRIPT_PATH", "/usr/local/bin/grade.py"),
-		AllowedOrigins:      parseAllowedOrigins(getEnv("ALLOWED_ORIGINS", "*")),
 		RequireAPIKey:       getEnvBool("REQUIRE_API_KEY", false),
 		ValidAPIKeys:        parseAPIKeys(getEnv("VALID_API_KEYS", "")),
-		AllowDirectAPICalls: getEnvBool("ALLOW_DIRECT_API_CALLS", false),
+		AllowedIPs:          parseAllowedIPs(getEnv("ALLOWED_IPS", "")),
 	}
 	
 	// Convert MB to bytes for file size
@@ -520,7 +475,8 @@ func configHandler(w http.ResponseWriter, r *http.Request) {
 		"uploads_dir":             config.UploadsDir,
 		"grading_script_path":     config.GradingScriptPath,
 		"require_api_key":         config.RequireAPIKey,
-		"allow_direct_api_calls":  config.AllowDirectAPICalls,
+		"ip_whitelist_enabled":    len(config.AllowedIPs) > 0,
+		"allowed_ips_count":       len(config.AllowedIPs),
 		"api_keys_configured":     len(config.ValidAPIKeys),
 	}
 	
@@ -853,28 +809,21 @@ func generateJobID() string {
 	return base64.RawURLEncoding.EncodeToString(u[:])
 }
 
-// parseAllowedOrigins parses comma-separated origins and normalizes them
-func parseAllowedOrigins(origins string) []string {
-	if origins == "" {
-		return []string{} // Empty list = no CORS (will block all)
+// parseAllowedIPs parses comma-separated IP addresses and CIDR blocks
+func parseAllowedIPs(ips string) []string {
+	if ips == "" {
+		return []string{}
 	}
 	
-	// Special case: "*" means allow all origins
-	if origins == "*" {
-		return []string{"*"}
-	}
-	
-	var allowedOrigins []string
-	for _, origin := range strings.Split(origins, ",") {
-		origin = strings.TrimSpace(origin)
-		if origin != "" {
-			// Normalize the origin (remove trailing slash)
-			origin = strings.TrimSuffix(origin, "/")
-			allowedOrigins = append(allowedOrigins, origin)
+	var allowedIPs []string
+	for _, ip := range strings.Split(ips, ",") {
+		ip = strings.TrimSpace(ip)
+		if ip != "" {
+			allowedIPs = append(allowedIPs, ip)
 		}
 	}
 	
-	return allowedOrigins
+	return allowedIPs
 }
 
 //------------------------------------------------------------------------------
@@ -913,30 +862,31 @@ func main() {
 			}
 		}
 	}
-	fmt.Printf("   Allow Direct API Calls: %v\n", config.AllowDirectAPICalls)
+
+	// Print IP whitelist configuration
+	if len(config.AllowedIPs) == 0 {
+		fmt.Printf("   IP Whitelist: DISABLED (allow all IPs) - ⚠️  DEVELOPMENT ONLY\n")
+	} else {
+		fmt.Printf("   IP Whitelist: %d IP(s) configured - 🔒 MAXIMUM SECURITY:\n", len(config.AllowedIPs))
+		for _, ip := range config.AllowedIPs {
+			fmt.Printf("     - %s\n", ip)
+		}
+	}
 
 	// Security level assessment
-	if !config.RequireAPIKey {
-		fmt.Printf("   ⚠️  SECURITY LEVEL: MINIMAL (No API key required)\n")
-	} else if len(config.AllowedOrigins) == 1 && config.AllowedOrigins[0] == "*" {
-		fmt.Printf("   ⚠️  SECURITY LEVEL: MODERATE (API key + allow all origins)\n")
-	} else if config.AllowDirectAPICalls {
-		fmt.Printf("   🛡️  SECURITY LEVEL: HIGH (API key + origin whitelist + direct calls)\n")
+	if !config.RequireAPIKey && len(config.AllowedIPs) == 0 {
+		fmt.Printf("   ⚠️  SECURITY LEVEL: NONE (No protection) - DEVELOPMENT ONLY\n")
+	} else if !config.RequireAPIKey {
+		fmt.Printf("   🛡️  SECURITY LEVEL: BASIC (IP whitelist only)\n")
+	} else if len(config.AllowedIPs) == 0 {
+		fmt.Printf("   🛡️  SECURITY LEVEL: MODERATE (API key only)\n")
 	} else {
-		fmt.Printf("   🔒 SECURITY LEVEL: MAXIMUM (API key + strict origin whitelist)\n")
+		fmt.Printf("   🔒 SECURITY LEVEL: MAXIMUM (API key + IP whitelist)\n")
 	}
 	
 	// Print CORS configuration
-	if len(config.AllowedOrigins) == 1 && config.AllowedOrigins[0] == "*" {
-		fmt.Printf("   CORS: Allow all origins (*) - ⚠️  PERMISSIVE MODE\n")
-	} else if len(config.AllowedOrigins) == 0 {
-		fmt.Printf("   CORS: Block all origins - 🔒 MAXIMUM SECURITY\n")
-	} else {
-		fmt.Printf("   CORS: Restricted to %d origin(s) - 🛡️  SECURE MODE:\n", len(config.AllowedOrigins))
-		for _, origin := range config.AllowedOrigins {
-			fmt.Printf("     - %s\n", origin)
-		}
-	}
+	fmt.Printf("   CORS: Permissive (allow all origins) - 🌐 BROWSER COMPATIBLE\n")
+	fmt.Printf("   Note: CORS is permissive because IP whitelist provides primary security\n")
 	fmt.Println()
 
 	// Initialize queue with configured buffer size
@@ -978,7 +928,6 @@ func main() {
 		fmt.Println("\n🔐 Security Information:")
 		fmt.Println("  API key required for all endpoints except /health")
 		fmt.Println("  Send API key in 'X-API-Key' header or 'Authorization: Bearer {key}'")
-		fmt.Printf("  Direct API calls allowed: %v\n", config.AllowDirectAPICalls)
 	} else {
 		fmt.Println("\n⚠️  WARNING: API key authentication is DISABLED")
 		fmt.Println("  Set REQUIRE_API_KEY=true for production use")

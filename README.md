@@ -11,8 +11,7 @@ docker build -t digitalocean-app-test .
 docker run -p 8080:8080 \
     -e REQUIRE_API_KEY=true \
     -e VALID_API_KEYS="test-key-123" \
-    -e ALLOWED_ORIGINS="http://localhost:8080" \
-    -e ALLOW_DIRECT_API_CALLS=true \
+    -e ALLOWED_IPS="172.17.0.0/16,127.0.0.1" \
     -e GRADING_TIMEOUT_MIN=10 \
     -e MAX_FILE_SIZE_MB=100 \
     digitalocean-app-test

@@ -1,0 +1,102 @@
+<!--
+    This code demonstrates how to interact with the ByteGrader remote API. Simply paste this into
+    a web page to create a simple file submission widget for grading assignments (e.g. as an HTML
+    block in a WordPress post or a custom HTML widget). Replace `API_ENDPOINT` and `API_KEY` with 
+    the values provided by your server administrator or API provider. The code below outlines the 
+    usage and expected parameters for the API integration.
+-->
+
+<div id="bytegrader-test">
+    <h3>Submit File for Grading</h3>
+    <form id="submit-form">
+        <input type="file" id="file-input" accept=".zip,.py,.java,.cpp" required>
+        <button type="submit">Submit</button>
+    </form>
+    <div id="status"></div>
+</div>
+
+<script>
+(function() {
+    const API_ENDPOINT = 'https://bytegrader-xxxx.ondigitalocean.app';  // Replace with actual URL
+    const API_KEY = 'your-api-key-here';    // Replace with actual API key
+    
+    const form = document.getElementById('submit-form');
+    const fileInput = document.getElementById('file-input');
+    const status = document.getElementById('status');
+    
+    form.addEventListener('submit', async function(e) {
+        e.preventDefault();
+        
+        const file = fileInput.files[0];
+        if (!file) {
+            status.textContent = 'Please select a file';
+            return;
+        }
+        
+        // Show submitting status
+        status.textContent = 'Submitting...';
+        
+        try {
+            // Submit file
+            const formData = new FormData();
+            formData.append('file', file);
+            
+            const response = await fetch(`${API_ENDPOINT}/submit`, {
+                method: 'POST',
+                headers: {
+                    'X-API-Key': API_KEY
+                },
+                body: formData
+            });
+            
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+            }
+            
+            const data = await response.json();
+            
+            if (data.job_id) {
+                status.textContent = 'Grading...';
+                pollForResult(data.job_id);
+            } else {
+                throw new Error('No job ID returned');
+            }
+            
+        } catch (error) {
+            status.textContent = `Error: ${error.message}`;
+        }
+    });
+    
+    async function pollForResult(jobId) {
+        try {
+            const response = await fetch(`${API_ENDPOINT}/status/${jobId}`, {
+                headers: {
+                    'X-API-Key': API_KEY
+                }
+            });
+            
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}`);
+            }
+            
+            const data = await response.json();
+            
+            if (data.job && data.job.status === 'completed') {
+                status.innerHTML = `
+                    <strong>Complete!</strong><br>
+                    Score: ${data.job.result.score}/100<br>
+                    Feedback: ${data.job.result.feedback}
+                `;
+            } else if (data.job && data.job.status === 'failed') {
+                status.textContent = `Failed: ${data.job.result.error}`;
+            } else {
+                // Still processing, check again in 3 seconds
+                setTimeout(() => pollForResult(jobId), 3000);
+            }
+            
+        } catch (error) {
+            status.textContent = `Polling error: ${error.message}`;
+        }
+    }
+})();
+</script>

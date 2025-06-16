@@ -391,7 +391,7 @@ func loadConfig() *Config {
 		// Rate limiting configuration
 		RateLimitEnabled:    getEnvBool("RATE_LIMIT_ENABLED", true),
 		RateLimitRequests:   getEnvInt("RATE_LIMIT_REQUESTS", 10),
-		RateLimitWindow:     time.Duration(getEnvInt("RATE_LIMIT_WINDOW_MINUTES", 5)) * time.Minute,
+		RateLimitWindow:     time.Duration(getEnvInt("RATE_LIMIT_WINDOW_MIN", 5)) * time.Minute,
 		
 		// Resource limits
 		MaxConcurrentJobs:   getEnvInt("MAX_CONCURRENT_JOBS", 3),

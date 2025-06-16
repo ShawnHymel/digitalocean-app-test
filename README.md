@@ -66,6 +66,8 @@ You should see "Building..." on the next page. You will need to change some envi
  * `ALLOWED_IPS`: `x.x.x.x,y:y:y:y::/64` (do a manual DNS lookup for your intended client host)
  * `GRADING_TIMEOUT_MIN`: `10`
  * `MAX_FILE_SIZE_MB`: `100`
+ * `RATE_LIMIT_REQUESTS`: `10`
+ * `RATE_LIMIT_WINDOW_MIN`: `5`
 
 Save, and after a few minutes, you should be able to try out your application.
 
